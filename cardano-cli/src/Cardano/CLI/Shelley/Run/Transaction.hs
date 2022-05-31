@@ -104,6 +104,7 @@ data ShelleyTxCmdError
   | ShelleyTxCmdNotImplemented !Text
   | ShelleyTxCmdWitnessEraMismatch !AnyCardanoEra !AnyCardanoEra !WitnessFile
   | ShelleyTxCmdScriptLanguageNotSupportedInEra !AnyScriptLanguage !AnyCardanoEra
+  | ShelleyTxCmdReferenceScriptsNotSupportedInEra !AnyCardanoEra
   | ShelleyTxCmdScriptExpectedSimple !FilePath !AnyScriptLanguage
   | ShelleyTxCmdScriptExpectedPlutus !FilePath !AnyScriptLanguage
   | ShelleyTxCmdGenesisCmdError !ShelleyGenesisCmdError
@@ -271,6 +272,8 @@ renderShelleyTxCmdError err =
     ShelleyTxCmdPParamExecutionUnitsNotAvailable ->
       "Execution units not available in the protocol parameters. This is \
       \likely due to not being in the Alonzo era"
+    ShelleyTxCmdReferenceScriptsNotSupportedInEra (AnyCardanoEra era) ->
+      "Reference scripts not supported in era: " <> show era
 
 renderEra :: AnyCardanoEra -> Text
 renderEra (AnyCardanoEra ByronEra)   = "Byron"
@@ -356,7 +359,7 @@ runTxBuildRaw
   -- ^ Return collateral
   -> Maybe Lovelace
   -- ^ Total collateral
-  -> [TxIn]
+  -> [(TxIn, Maybe TxIn, Maybe (ScriptWitnessFiles WitCtxTxIn))]
   -- ^ Reference TxIn
   -> [TxOutAnyEra]
   -> Maybe SlotNo
@@ -440,7 +443,7 @@ runTxBuild
   -- ^ Return collateral
   -> Maybe Lovelace
   -- ^ Total collateral
-  -> [TxIn]
+  -> [(TxIn, Maybe TxIn, Maybe (ScriptWitnessFiles WitCtxTxIn))]
   -- ^ Reference TxIns
   -> [TxOutAnyEra]
   -- ^ Normal outputs
@@ -663,15 +666,40 @@ validateTxInsCollateral era txins =
       Nothing -> txFeatureMismatch era TxFeatureCollateral
       Just supported -> return (TxInsCollateral supported txins)
 
-validateTxInsReference :: CardanoEra era
-                       -> [TxIn]
-                       -> ExceptT ShelleyTxCmdError IO (TxInsReference era)
+validateTxInsReference :: forall era. CardanoEra era
+                       -> [(TxIn, Maybe TxIn, Maybe (ScriptWitnessFiles WitCtxTxIn))]
+                       -> ExceptT ShelleyTxCmdError IO (TxInsReference BuildTx era)
 validateTxInsReference _ [] = return TxInsReferenceNone
 validateTxInsReference era txins =
   case refInsScriptsAndInlineDatsSupportedInEra era of
     Nothing -> txFeatureMismatch era TxFeatureReferenceInputs
-    Just supp -> return $ TxInsReference supp txins
-
+    Just supp -> do
+      final <- mapM convert txins
+      return $ TxInsReference supp final
+ where
+  convert
+    :: (TxIn, Maybe TxIn, Maybe (ScriptWitnessFiles WitCtxTxIn))
+    -> ExceptT ShelleyTxCmdError IO
+       -- So we must pass the txin we are using for the reference
+       -- script witness, and the txin that we may or may not intend
+       -- to spend. Users are free to include a reference script but
+       -- not use it to witness the spending of any txin.
+               ( Maybe TxIn
+               , BuildTxWith BuildTx (Witness WitCtxTxIn era)
+               , ReferenceInput
+               )
+  convert (txinRef, mTxInToSpend, mScriptWitnessFiles) =
+    case mScriptWitnessFiles of
+      Just scriptWitnessFiles -> do
+        sWit <- createScriptWitness era scriptWitnessFiles
+        return ( mTxInToSpend
+               , BuildTxWith $ ScriptWitness ScriptWitnessForSpending sWit
+               , ReferenceInput txinRef
+               )
+      Nothing -> return ( Nothing
+                        , BuildTxWith $ KeyWitness KeyWitnessForSpending
+                        , ReferenceInput txinRef
+                        )
 
 validateTxOuts :: forall era.
                   CardanoEra era
@@ -997,9 +1025,9 @@ validateTxMintValue era (Just (val, scriptWitnessFiles)) =
         -- The set (and map) of policy ids for which we have witnesses:
         witnesses <- mapM (createScriptWitness era) scriptWitnessFiles
         let witnessesProvidedMap :: Map PolicyId (ScriptWitness WitCtxMint era)
-            witnessesProvidedMap = Map.fromList
-                                     [ (scriptWitnessPolicyId witness, witness)
-                                     | witness <- witnesses ]
+            witnessesProvidedMap =
+              Map.fromList [ (\(Just pid, w) -> (pid, w)) (scriptWitnessPolicyId witness, witness)
+                           | witness <- witnesses ]
             witnessesProvidedSet = Map.keysSet witnessesProvidedMap
 
         -- Check not too many, nor too few:
@@ -1020,11 +1048,11 @@ validateTxMintValue era (Just (val, scriptWitnessFiles)) =
       where
         witnessesExtra = Set.elems (witnessesProvided Set.\\ witnessesNeeded)
 
-scriptWitnessPolicyId :: ScriptWitness witctx era -> PolicyId
+scriptWitnessPolicyId :: ScriptWitness witctx era -> Maybe PolicyId
 scriptWitnessPolicyId witness =
   case scriptWitnessScript witness of
-    ScriptInEra _ script -> scriptPolicyId script
-
+    Just (ScriptInEra _ script) -> Just $ scriptPolicyId script
+    Nothing -> Nothing
 
 createScriptWitness
   :: CardanoEra era
@@ -1073,6 +1101,38 @@ createScriptWitness era (PlutusScriptWitnessFiles
                  scriptFile
                  (AnyScriptLanguage lang)
 
+createScriptWitness era SimpleReferenceScriptWitnessFiles =
+   case refInsScriptsAndInlineDatsSupportedInEra era of
+    Nothing -> left $ ShelleyTxCmdReferenceScriptsNotSupportedInEra
+                    $ getIsCardanoEraConstraint era (AnyCardanoEra era)
+    Just _ -> return SimpleReferenceScriptWitness
+
+createScriptWitness era (PlutusReferenceScriptWitnessFiles
+                          anyScrLang@(AnyScriptLanguage anyScriptLanguage)
+                          datumOrFile redeemerOrFile execUnits) = do
+  case refInsScriptsAndInlineDatsSupportedInEra era of
+    Nothing -> left $ ShelleyTxCmdReferenceScriptsNotSupportedInEra
+                    $ getIsCardanoEraConstraint era (AnyCardanoEra era)
+    Just _ -> do
+      datum    <- readScriptDatumOrFile    datumOrFile
+      redeemer <- readScriptRedeemerOrFile redeemerOrFile
+      case scriptLanguageSupportedInEra era anyScriptLanguage of
+        Just sLangInEra ->
+          return $ PlutusReferenceScriptWitness
+                     sLangInEra
+                     (languageOfScriptLanguageInEra sLangInEra)
+                     datum redeemer execUnits
+        Nothing ->
+          left $ ShelleyTxCmdScriptLanguageNotSupportedInEra anyScrLang (anyCardanoEra era)
+
+getIsCardanoEraConstraint
+  :: CardanoEra era -> (IsCardanoEra era => a) -> a
+getIsCardanoEraConstraint ByronEra f = f
+getIsCardanoEraConstraint ShelleyEra f = f
+getIsCardanoEraConstraint AllegraEra f = f
+getIsCardanoEraConstraint MaryEra f = f
+getIsCardanoEraConstraint AlonzoEra f = f
+getIsCardanoEraConstraint BabbageEra f = f
 
 readScriptDatumOrFile :: ScriptDatumOrFile witctx
                       -> ExceptT ShelleyTxCmdError IO (ScriptDatum witctx)
@@ -1177,7 +1237,6 @@ runTxSign txOrTxBody witSigningData mnw (TxFile outTxFile) = do
 
           firstExceptT ShelleyTxCmdWriteFileError . newExceptT $
             writeFileTextEnvelope outTxFile Nothing tx
-
 
 -- ----------------------------------------------------------------------------
 -- Transaction submission
